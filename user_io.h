@@ -285,6 +285,7 @@ char is_neogeo();
 char is_neogeo_cd();
 char is_megacd();
 char is_pce();
+char is_cdgplayer();
 char is_archie();
 char is_gba();
 char is_c64();

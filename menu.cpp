@@ -2940,6 +2940,10 @@ void HandleUI(void)
 				game_docs_init(selPath, 0);
 				cheats_init(selPath, 0);
 			}
+			else if (is_cdgplayer())
+			{
+				cdg_set_image(ioctl_index, selPath);
+			}
 			else if (is_psx() && ioctl_index == 1)
 			{
 				psx_mount_cd(user_io_ext_idx(selPath, fs_pFileExt) << 6 | (menusub + 1), ioctl_index, selPath);

@@ -336,6 +336,13 @@ char is_pce()
 	return (is_pce_type == 1);
 }
 
+static int is_cdgplayer_type = 0;
+char is_cdgplayer()
+{
+	if (!is_cdgplayer_type) is_cdgplayer_type = strcasecmp(orig_name, "CDGPLAYER") ? 2 : 1;
+	return (is_cdgplayer_type == 1);
+}
+
 static int is_archie_type = 0;
 char is_archie()
 {
@@ -502,6 +509,7 @@ void user_io_read_core_name()
 	is_minimig_type = 0;
 	is_megacd_type = 0;
 	is_pce_type = 0;
+	is_cdgplayer_type = 0;
 	is_archie_type = 0;
 	is_gba_type = 0;
 	is_c64_type = 0;
@@ -1051,6 +1059,10 @@ static void parse_config()
 						pcecd_set_image(idx, str);
 						game_docs_init(str, 0);
 						cheats_init(str, 0);
+					}
+					else if (is_cdgplayer())
+					{
+						cdg_set_image(idx, str);
 					}
 					else if (is_marty())
 					{
@@ -4055,6 +4067,7 @@ void user_io_poll()
 
 	if (is_megacd()) mcd_poll();
 	if (is_pce()) pcecd_poll();
+	if (is_cdgplayer()) cdg_poll();
 	if (is_saturn()) saturn_poll();
 	if (is_marty()) marty_poll();
 	if (is_pcfx()) pcfx_poll();

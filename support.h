@@ -71,6 +71,7 @@
 
 // PCECD  support
 #include "support/pcecd/pcecd.h"
+#include "support/cdgplayer/cdgplayer.h"
 
 // PSX support
 #include "support/psx/psx.h"

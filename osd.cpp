@@ -686,6 +686,7 @@ void OsdUpdate()
 			DisableOsd();
 			if (is_megacd()) mcd_poll();
 			if (is_pce()) pcecd_poll();
+			if (is_cdgplayer()) cdg_poll();
 			if (is_saturn()) saturn_poll();
 			if (is_neogeo_cd()) neocd_poll();
 			if (is_3do()) p3do_poll();

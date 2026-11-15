@@ -43,6 +43,7 @@ typedef struct
 	int end;
 	int last;
 	int sectorSize;
+	int phys;	// toc read from a physical drive (support/physical_disc, from Main_MiSTer_Physical_Disc)
 	chd_file *chd_f;
 	int chd_hunksize;
 	cd_track_t tracks[100];
