@@ -1,26 +1,31 @@
 // CD+G player core support.
 //
-// The core streams the disc itself and asks for one sector at a time over EXT_BUS:
-//   UIO_CD_GET (0x34): word 0 = {command count, request count}, word 1 = LBA[15:0],
-//                      word 2 = {lyrics channel [7:4], LBA[19:16]}, word 3 = {audio mode [5:4], command [3:0]},
-//                      word 4 = CD+G channels the disc has used so far (bit n = channel n).
-//                      Commands: 1 next track, 2 previous track, 3 restart track, 4 fast forward step, 5 rewind step
-//                      (the core repeats 4 / 5 every 0.2 s while held), 6 lyrics channel changed, 7 track info (repeated
-//                      every 0.5 s while held), 8 next end-of-disc mode, 9 audio mode changed.
-//                      A new request count = send sector LBA; a new command count = run the command.
-//   UIO_CD_SET (0x35): flags (bit 0 disc loaded, bit 1 seek, bit 2 new disc: the core forgets the channels seen and
-//                      goes back to lyrics channel 1, bit 3 hold: stopped until Start), seek LBA [15:0], [19:16].
-// A sector goes to the core as one download on ioctl index 2: 2448 bytes = 2352 bytes CD audio (16-bit
-// little-endian, the CHD stores it big-endian) + 96 bytes subcode as stored in the CHD (raw P-W, R..W in
-// bits 5..0). Tracks without subcode send zeros there (audio only).
-// End of a track / the disc: the core asks ~6 sectors ahead of what it plays, so past the boundary it gets silence
-// until the last real sector has played; the next request is not answered but replaced by the end action (a seek
-// voids it): stop (back to the first track, held until Start), repeat the disc, or shuffle (every audio track once in
-// a random order, then a new order that does not start with the track just played; next / previous follow it).
-// CD drive (support/physical_disc, from Main_MiSTer_Physical_Disc): the tray is polled every 0.5 s while the core runs.
-// A disc going in plays from the drive (raw P-W subcode, audio already little-endian), taking over from a CHD; picking a
-// CHD in the OSD takes over from the drive; the disc coming out stops it. A disc already in when the core starts plays
-// unless a CHD was mounted.
+// The core plays the disc itself and asks Main for one sector at a time over EXT_BUS.
+//
+// UIO_CD_GET (0x34), five words read from the core:
+//   0: command count (high byte), request count (low byte)
+//   1: requested LBA, bits 15..0
+//   2: lyrics channel in bits 7..4, LBA bits 19..16 in bits 3..0
+//   3: audio mode in bits 5..4, command in bits 3..0
+//   4: CD+G channels the disc has used so far, one bit per channel
+// A new request count asks for the sector at that LBA. A new command count asks Main to run the command:
+// 1 next track, 2 previous track, 3 restart track, 4 fast forward, 5 rewind, 6 lyrics channel changed, 7 track info,
+// 8 next end-of-disc mode, 9 audio mode changed. The core repeats 4, 5 and 7 while the button is held.
+//
+// UIO_CD_SET (0x35), four words sent to the core: flags, seek LBA bits 15..0, LBA bits 19..16, unused.
+// Flags: bit 0 disc loaded, bit 1 seek, bit 2 new disc (back to lyrics channel 1), bit 3 hold until Start.
+//
+// Each sector goes to the core as one download on ioctl index 2: 2352 bytes of CD audio (16-bit little-endian;
+// the CHD stores it big-endian) followed by the 96 bytes of raw P-W subcode as stored in the CHD (R..W in bits 5..0).
+// Tracks without subcode send zeros there.
+//
+// The core requests a few sectors ahead of what it plays. Past the end of the disc (in shuffle: of the track) Main
+// sends silence until the last real sector has played, then answers the next request with the end action instead:
+// stop at the first track, repeat the disc, or play the next track of the shuffle order.
+//
+// CD drive (support/physical_disc): inserting a disc plays it, taking over from a mounted CHD; mounting a CHD takes
+// over from the drive; removing the disc stops playback. A disc already in the drive when the core starts plays
+// unless a CHD is mounted.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,14 +52,14 @@
 #define CDG_SECTOR_INDEX 2
 #define CDG_SECTOR_SIZE  2448
 #define CDG_AUDIO_SIZE   2352
-#define CDG_SCAN_FWD     60       // sectors per fast forward step (+ ~15 played per 0.2 s step = ~5x)
-#define CDG_SCAN_BACK    90       // sectors per rewind step (- ~15 played = ~-5x)
-#define CDG_AHEAD        6        // requests run this many sectors ahead of what plays
-#define CDG_PAD          7        // silent sectors past a boundary before the end action
-#define CDG_TRAY_MS      500      // CD drive tray poll period
-#define CDG_PRIME        300      // CD drive: sectors (4 s) read into its cache before a disc starts playing
-#define CDG_PRIME_MS     10000    // ... giving up (and playing anyway) after this long
-#define CDG_HEAD         75       // CD drive: first second of the disc served from Main's own reads (see read_head)
+#define CDG_SCAN_FWD     60       // sectors skipped per fast forward step (about 5x speed)
+#define CDG_SCAN_BACK    90       // sectors skipped back per rewind step (about 5x speed)
+#define CDG_AHEAD        6        // how far the core's requests run ahead of playback
+#define CDG_PAD          7        // silent sectors sent past the end before the end action
+#define CDG_TRAY_MS      500      // CD drive: tray poll period
+#define CDG_PRIME        300      // CD drive: sectors read into the cache before playback starts (4 s)
+#define CDG_PRIME_MS     10000    // CD drive: stop waiting for those after this long
+#define CDG_HEAD         75       // CD drive: sectors at the start of track 1 read directly (see read_head)
 
 enum { END_STOP, END_REPEAT, END_SHUFFLE };
 
@@ -215,8 +220,7 @@ static void new_disc()
 	last_cmd = cmd;
 }
 
-// One raw sector (audio + P-W subcode) straight from the drive, bypassing physical_disc's cache. Unlike
-// physical_disc's scsi_read_cd it checks resid: a "successful" read that transferred less is a failure.
+// Read one sector (audio + raw P-W subcode) straight from the drive. A short transfer counts as a failure.
 static int direct_read(int fd, int lba, uint8_t *dst)
 {
 	uint8_t cdb[12] = { 0xBE, 0x04 }, sense[32];
@@ -231,12 +235,9 @@ static int direct_read(int fd, int lba, uint8_t *dst)
 	return io.resid ? -3 : 0;
 }
 
-// The first second of the disc (track 1) is read here, straight from the drive, and always served from this copy.
-// HW 2026-11-15 (SuperStationOne dock drive, Information Society): physical_disc's cache held other audio for LBA 0-15
-// every time (from ~17 s in after a re-insert; from LBA 300 right after a 300-sector prime). Its scsi_read_cd ignores
-// resid, so a short transfer leaves the previous read in its buffer, and its read of the start after reading
-// elsewhere came back short; every play of the track start, restart included, served it. Clearing its cache
-// (physical_disc_load_toc) and priming again gave the same result 3 times in a row.
+// physical_disc does not check for short transfers, and its read of the start of track 1 can come back short,
+// leaving data from its previous read in the cache. The first second of track 1 is read here instead and always
+// served from this copy.
 static void read_head()
 {
 	head_n = 0;
@@ -256,7 +257,7 @@ static void read_head()
 	printf("CDG: CD drive: first %d sectors read directly\n", head_n);
 }
 
-// one sector from the drive: the directly read start, else physical_disc's cache (0 = read ok)
+// One sector from the drive: the start of track 1 from read_head, the rest from physical_disc's cache.
 static int drive_sector(int lba, uint8_t *buf)
 {
 	int i = lba - head_lba;
@@ -265,15 +266,14 @@ static int drive_sector(int lba, uint8_t *buf)
 		memcpy(buf, head[i], CDG_SECTOR_SIZE);
 		return 0;
 	}
-	// audio comes little-endian from the drive; read_sector_sub 0 = no subcode
+	// the drive delivers audio little-endian; no subcode = zeros
 	int r = physical_disc_read_sector(lba, buf, buf + CDG_AUDIO_SIZE);
 	if (r || !physical_disc_read_sector_sub(lba, buf, buf + CDG_AUDIO_SIZE))
 		memset(buf + CDG_AUDIO_SIZE, 0, CDG_SECTOR_SIZE - CDG_AUDIO_SIZE);
 	return r;
 }
 
-// CD drive: read the start of the first track into the drive cache before playing, so the drive spinning up and
-// settling at its capped speed does not starve the core (stutter at the start)
+// Fill physical_disc's cache with the first seconds of the track before playback starts.
 static void prime_drive(int t)
 {
 	static uint8_t tmp[CDG_SECTOR_SIZE];
@@ -332,11 +332,10 @@ static void open_drive()
 		return;
 	}
 	drive = 1;
-	// physical_disc_prewarm_blocking() is not used: it also seeks to 1/4, 1/2 and 3/4 of the disc (for game
-	// discs), which left the head away from track 1 when playback started; prime_drive() reads the start instead
+	// physical_disc_prewarm_blocking() is not used: it also seeks across the disc, which suits game discs, not audio
 	Info("CD drive: reading disc...", 10000);
 
-	// the drive must hand over raw P-W subcode for the graphics; a sector a little into the first audio track tells
+	// the graphics need raw P-W subcode from the drive: check one sector
 	static uint8_t probe[CDG_SECTOR_SIZE];
 	int sub = physical_disc_read_sector_sub(toc.tracks[first_audio()].start + 16, probe, probe + CDG_AUDIO_SIZE);
 	printf("CDG: CD drive %s, %d tracks (%d audio), subcode %s\n", physical_disc_device(), toc.last, audio, sub ? "yes" : "no");
@@ -346,11 +345,8 @@ static void open_drive()
 	Info(msg, sub ? 1500 : 4000);
 }
 
-// tray poll: disc in = play it from the drive, disc out = stop (only if the drive is what plays)
-// Tray state from a thread of its own, on its own handle. HW 2026-11-15 (SuperStationOne dock drive): with the tray
-// check on the main loop (physical_disc_tray_status every 0.5 s) a disc lost its first 1-2 s of audio when it started
-// (not on a later restart of the track); with this thread it does not. Why is not measured: here the ioctl took
-// <= 26 ms during the first 10 s of play.
+// The tray is polled from a thread of its own, with its own handle on the drive. Polling it from the main loop
+// made a disc lose the first seconds of audio when it started.
 static volatile int tray_state = -2;   // physical_disc_tray_t, -2 = not polled yet
 static void *tray_thread(void *)
 {
@@ -380,6 +376,7 @@ static void *tray_thread(void *)
 	return NULL;
 }
 
+// Disc inserted: play it from the drive. Disc removed: stop, if the drive is what plays.
 static void poll_tray()
 {
 	static int started = 0;
@@ -494,7 +491,7 @@ static void show_channel()
 	Info(msg, 2000);
 }
 
-// button X (held: repeated every 0.5 s, so the popup stays up while held and goes ~0.2 s after release)
+// button X: the core repeats the command every 0.5 s while held, so the popup stays up until release
 static void show_info(int lba)
 {
 	int t = playing_track(lba);
@@ -565,7 +562,7 @@ static int run_command(int code, int lba)
 	case 7: show_info(lba); return 0;
 	case 8:
 		end_mode = (end_mode + 1) % 3;
-		if (end_mode == END_SHUFFLE) make_order(t, -1);   // the playing (or, stopped, the waiting) track stays first
+		if (end_mode == END_SHUFFLE) make_order(t, -1);   // the current track stays first in the order
 		else order_n = 0;
 		show_end_mode();
 		return 0;
@@ -594,7 +591,7 @@ void cdg_poll()
 	if (req != last_req)
 	{
 		last_req = req;
-		stopped = 0;          // a request = the core plays (Start after a stop)
+		stopped = 0;          // the core only requests while playing (also after Start ends a stop)
 		send_sector(lba);
 	}
 }
